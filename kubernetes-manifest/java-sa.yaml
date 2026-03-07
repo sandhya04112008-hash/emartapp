@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: javaapi-sa
+  namespace: emart
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::729127835402:role/emart-javaapi-irsa

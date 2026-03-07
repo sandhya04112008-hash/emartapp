@@ -1,0 +1,41 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: emart-ingress
+  namespace: emart
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:ap-south-1:259068869656:certificate/a21889e8-4012-4a66-aef6-9861002587b7
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+spec:
+  ingressClassName: alb
+  rules:
+  - host: emart.qmvpro.shop
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: clientsvc
+            port:
+              number: 4200
+
+      - path: /api/shop
+        pathType: Prefix
+        backend:
+          service:
+            name: javaapi-svc
+            port:
+              number: 9000
+
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: nodeapi
+            port:
+              number: 5000

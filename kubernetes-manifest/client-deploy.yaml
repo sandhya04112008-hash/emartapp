@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name:  clientui
+  namespace: emart
+  labels:
+    app:  clientui
+spec:
+  selector:
+    matchLabels:
+      app: clientui
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app:  clientui
+    spec:
+      containers:
+      - name:  clientui
+        image: aravindepic/client:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort:  4200
+        resources:
+          requests:
+            cpu: 100m
+            memory: 100Mi
+          limits:
+            cpu: 100m
+            memory: 100Mi
+        

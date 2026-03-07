@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: javaapi
+  namespace: emart
+  labels:
+    app: javaapi
+spec:
+  selector:
+    matchLabels:
+      app: javaapi
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: javaapi
+    spec:
+      serviceAccountName: javaapi-sa
+      # initContainers:
+        # Init containers are exactly like regular containers, except:
+          # - Init containers always run to completion.
+          # - Each init container must complete successfully before the next one starts.
+      containers:
+      - name: javaapi
+        image:  aravindepic/javaapi:latest
+        ports:
+        - containerPort: 9000
+        env:
+        - name: AWS_REGION
+          value: ap-south-1
+        envFrom:
+        - secretRef:
+            name: emart-db-credentials-app-devsecret
+        resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
