@@ -13,9 +13,11 @@ curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stabl
 install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 
 
+
 #Instal aws cli
+sudo install unzip 
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip awscliv2.zip
+sudo unzip awscliv2.zip
 sudo ./aws/install -i /usr/local/aws-cli -b /usr/local/bin
 
 #Install eksctl
@@ -26,8 +28,16 @@ mv eksctl /usr/local/bin/eksctl
 
 
 
-# Install Helm
-curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
-chmod 700 get_helm.sh
-./get_helm.sh
+# Download latest release
+curl -L https://get.helm.sh/helm-v3.14.0-linux-amd64.tar.gz -o helm.tar.gz
+
+# Extract
+tar -zxvf helm.tar.gz
+
+# Move to PATH
+sudo mv linux-amd64/helm /usr/local/bin/
+
+# Verify
+helm version
+
 
