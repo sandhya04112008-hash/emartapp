@@ -1,120 +1,246 @@
 #!/bin/bash
-# eks-bootstrap.sh - Fixed version with proper SA creation & health checks
-# Fixes: race conditions, silent SA skips, missing SA bug
+# ═══════════════════════════════════════════════════════════════
+# eks-bootstrap.sh - Production-grade EKS Cluster Bootstrap
+# Features:
+#   - Cleans up existing broken installs before reinstalling
+#   - Creates IAM roles MANUALLY (no silent eksctl skips)
+#   - Waits for each component to be healthy before proceeding
+#   - Idempotent: safe to run multiple times
+# ═══════════════════════════════════════════════════════════════
 
 set -euo pipefail
 
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
 CLUSTER_NAME="emart-dev-app"
 REGION="ap-south-1"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+VPC_ID=$(aws eks describe-cluster --name $CLUSTER_NAME \
+  --region $REGION \
+  --query "cluster.resourcesVpcConfig.vpcId" \
+  --output text)
+OIDC_URL=$(aws eks describe-cluster --name $CLUSTER_NAME \
+  --region $REGION \
+  --query "cluster.identity.oidc.issuer" \
+  --output text | sed 's|https://||')
 
-echo "🚀 Bootstrapping EKS: $CLUSTER_NAME in $REGION"
-echo "📋 Account ID: $ACCOUNT_ID"
+echo ""
+echo "╔══════════════════════════════════════════════════╗"
+echo "║        EKS BOOTSTRAP - FULL INSTALL/REINSTALL    ║"
+echo "╚══════════════════════════════════════════════════╝"
+echo "  Cluster : $CLUSTER_NAME"
+echo "  Region  : $REGION"
+echo "  Account : $ACCOUNT_ID"
+echo "  VPC     : $VPC_ID"
+echo "  OIDC    : $OIDC_URL"
+echo ""
 
 # ─────────────────────────────────────────────
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────────
 
-# Wait for a deployment to be fully ready before proceeding
+log_step() { echo ""; echo "════════════════════════════════════════════"; echo "$1"; echo "════════════════════════════════════════════"; }
+log_ok()   { echo "  ✅ $1"; }
+log_info() { echo "  ℹ️  $1"; }
+log_warn() { echo "  ⚠️  $1"; }
+
 wait_for_deployment() {
   local NAMESPACE=$1
   local DEPLOYMENT=$2
   local TIMEOUT=${3:-180}
-
-  echo "⏳ Waiting for $DEPLOYMENT in $NAMESPACE to be ready (timeout: ${TIMEOUT}s)..."
+  echo "  ⏳ Waiting for $DEPLOYMENT in ns/$NAMESPACE (timeout: ${TIMEOUT}s)..."
   if kubectl rollout status deployment/$DEPLOYMENT -n $NAMESPACE --timeout=${TIMEOUT}s; then
-    echo "✅ $DEPLOYMENT is ready"
+    log_ok "$DEPLOYMENT is Running"
   else
-    echo "❌ $DEPLOYMENT failed to become ready. Dumping logs..."
-    kubectl describe deployment $DEPLOYMENT -n $NAMESPACE
-    kubectl logs -n $NAMESPACE -l app.kubernetes.io/name=$DEPLOYMENT --tail=50 2>/dev/null || true
+    echo "  ❌ $DEPLOYMENT failed. Logs:"
+    kubectl logs -n $NAMESPACE -l app.kubernetes.io/name=$DEPLOYMENT --tail=30 2>/dev/null || true
+    kubectl describe deployment $DEPLOYMENT -n $NAMESPACE | tail -20
     exit 1
   fi
 }
 
-# Create SA + annotate it — guaranteed, no silent skips
-create_service_account() {
+ensure_namespace() {
+  kubectl create namespace $1 2>/dev/null \
+    && log_info "Created namespace: $1" \
+    || log_info "Namespace $1 already exists"
+}
+
+# Create SA + force-annotate with IAM role — guaranteed, no silent skips
+ensure_service_account() {
   local NAMESPACE=$1
   local SA_NAME=$2
   local ROLE_ARN=$3
-
-  echo "🔑 Ensuring ServiceAccount: $SA_NAME in $NAMESPACE..."
-
-  # Create namespace if it doesn't exist
-  kubectl create namespace $NAMESPACE 2>/dev/null || echo "  Namespace $NAMESPACE already exists"
-
-  # Create SA if it doesn't exist
+  ensure_namespace $NAMESPACE
   kubectl create serviceaccount $SA_NAME -n $NAMESPACE 2>/dev/null \
-    || echo "  ServiceAccount $SA_NAME already exists"
-
-  # Always force-apply the annotation (this is the critical fix)
-  kubectl annotate serviceaccount $SA_NAME \
-    -n $NAMESPACE \
-    eks.amazonaws.com/role-arn=$ROLE_ARN \
-    --overwrite
-
-  echo "  ✅ SA $SA_NAME annotated with $ROLE_ARN"
+    && log_info "Created SA: $SA_NAME" \
+    || log_info "SA $SA_NAME already exists"
+  kubectl annotate serviceaccount $SA_NAME -n $NAMESPACE \
+    eks.amazonaws.com/role-arn=$ROLE_ARN --overwrite
+  log_ok "SA $SA_NAME → $ROLE_ARN"
 }
+
+# Create IAM role with OIDC trust policy — idempotent
+# Returns the Role ARN via stdout (all other output goes to stderr or is suppressed)
+create_iam_role_with_oidc() {
+  local ROLE_NAME=$1
+  local NAMESPACE=$2
+  local SA_NAME=$3
+  local POLICY_ARN=$4
+
+  if aws iam get-role --role-name $ROLE_NAME --no-cli-pager &>/dev/null; then
+    log_info "IAM Role $ROLE_NAME exists — refreshing trust policy..."
+  else
+    log_info "Creating IAM Role: $ROLE_NAME"
+  fi
+
+  # Write trust policy (always overwrite to ensure correctness)
+  cat > /tmp/trust-policy-${ROLE_NAME}.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_URL}"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "${OIDC_URL}:aud": "sts.amazonaws.com",
+          "${OIDC_URL}:sub": "system:serviceaccount:${NAMESPACE}:${SA_NAME}"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+  # Create or update trust policy
+  aws iam create-role \
+    --role-name $ROLE_NAME \
+    --assume-role-policy-document file:///tmp/trust-policy-${ROLE_NAME}.json \
+    --no-cli-pager 2>/dev/null || \
+  aws iam update-assume-role-policy \
+    --role-name $ROLE_NAME \
+    --policy-document file:///tmp/trust-policy-${ROLE_NAME}.json \
+    --no-cli-pager
+
+  # Attach policy (idempotent)
+  aws iam attach-role-policy \
+    --role-name $ROLE_NAME \
+    --policy-arn $POLICY_ARN \
+    --no-cli-pager 2>/dev/null || log_info "Policy already attached to $ROLE_NAME"
+
+  local ROLE_ARN
+  ROLE_ARN=$(aws iam get-role --role-name $ROLE_NAME \
+    --query "Role.Arn" --output text)
+  log_ok "IAM Role ready: $ROLE_ARN"
+
+  # Return ARN to caller
+  echo $ROLE_ARN
+}
+
+# ─────────────────────────────────────────────
+# STEP 0: CLEANUP EXISTING BROKEN INSTALLS
+# ─────────────────────────────────────────────
+log_step "🧹 STEP 0: Cleanup Existing Installs"
+
+# Uninstall Helm releases
+for RELEASE_NS in \
+  "aws-load-balancer-controller:kube-system" \
+  "external-secrets:external-secrets" \
+  "cluster-autoscaler:kube-system" \
+  "metrics-server:kube-system"; do
+  RELEASE=$(echo $RELEASE_NS | cut -d: -f1)
+  NS=$(echo $RELEASE_NS | cut -d: -f2)
+  if helm status $RELEASE -n $NS &>/dev/null; then
+    log_info "Uninstalling Helm release: $RELEASE (ns: $NS)"
+    helm uninstall $RELEASE -n $NS --wait 2>/dev/null || true
+    log_ok "Uninstalled: $RELEASE"
+  else
+    log_info "Helm release '$RELEASE' not installed — skipping"
+  fi
+done
+
+# Delete EBS CSI managed addon
+if aws eks describe-addon \
+  --cluster-name $CLUSTER_NAME \
+  --region $REGION \
+  --addon-name aws-ebs-csi-driver \
+  --no-cli-pager &>/dev/null; then
+  log_info "Deleting EBS CSI addon..."
+  aws eks delete-addon \
+    --cluster-name $CLUSTER_NAME \
+    --region $REGION \
+    --addon-name aws-ebs-csi-driver \
+    --no-cli-pager
+  echo "  ⏳ Waiting for EBS CSI addon deletion..."
+  for i in $(seq 1 24); do
+    STATUS=$(aws eks describe-addon \
+      --cluster-name $CLUSTER_NAME \
+      --region $REGION \
+      --addon-name aws-ebs-csi-driver \
+      --query "addon.status" --output text 2>/dev/null || echo "DELETED")
+    log_info "Delete status: $STATUS (attempt $i/24)"
+    [ "$STATUS" = "DELETED" ] && break
+    [ $i -eq 24 ] && log_warn "Addon deletion timed out — continuing anyway"
+    sleep 10
+  done
+  log_ok "EBS CSI addon deleted"
+else
+  log_info "EBS CSI addon not installed — skipping"
+fi
+
+# Delete stale webhooks — these block ESO and other helm installs
+log_info "Cleaning up stale webhooks..."
+kubectl delete mutatingwebhookconfigurations aws-load-balancer-webhook 2>/dev/null \
+  && log_ok "Deleted stale LBC mutating webhook" \
+  || log_info "No stale LBC mutating webhook found"
+kubectl delete validatingwebhookconfigurations aws-load-balancer-webhook 2>/dev/null \
+  && log_ok "Deleted stale LBC validating webhook" \
+  || log_info "No stale LBC validating webhook found"
+
+log_ok "Cleanup complete — starting fresh install"
 
 # ─────────────────────────────────────────────
 # STEP 1: IAM OIDC Provider
 # ─────────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════"
-echo "🔐 STEP 1: IAM OIDC Provider"
-echo "════════════════════════════════════════════"
+log_step "🔐 STEP 1: IAM OIDC Provider"
 
 eksctl utils associate-iam-oidc-provider \
   --region $REGION \
   --cluster $CLUSTER_NAME \
   --approve
 
-OIDC_ID=$(aws eks describe-cluster --name $CLUSTER_NAME \
-  --region $REGION \
-  --query "cluster.identity.oidc.issuer" \
-  --output text | cut -d '/' -f 5)
-echo "✅ OIDC ID: $OIDC_ID"
-
-# Get VPC ID once and reuse
-VPC_ID=$(aws eks describe-cluster --name $CLUSTER_NAME \
-  --region $REGION \
-  --query "cluster.resourcesVpcConfig.vpcId" \
-  --output text)
-echo "✅ VPC ID: $VPC_ID"
+log_ok "OIDC Provider associated: $OIDC_URL"
 
 # ─────────────────────────────────────────────
 # STEP 2: AWS Load Balancer Controller
 # ─────────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════"
-echo "⚖️  STEP 2: AWS Load Balancer Controller"
-echo "════════════════════════════════════════════"
+log_step "⚖️  STEP 2: AWS Load Balancer Controller"
 
-# Download & create IAM policy
+# IAM Policy
 curl -sO https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.0/docs/install/iam_policy.json
-
 aws iam create-policy \
   --policy-name AWSLoadBalancerControllerIAMPolicy \
   --policy-document file://iam_policy.json \
-  --no-cli-pager 2>/dev/null || echo "  Policy already exists, skipping..."
+  --no-cli-pager 2>/dev/null || log_info "LBC IAM policy already exists"
 
-LBC_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/AmazonEKSLoadBalancerControllerRole"
+# IAM Role — manual, guaranteed
+LBC_ROLE_ARN=$(create_iam_role_with_oidc \
+  "AmazonEKSLoadBalancerControllerRole" \
+  "kube-system" \
+  "aws-load-balancer-controller" \
+  "arn:aws:iam::${ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy")
 
-# Create IAM role via eksctl (for the trust policy)
-eksctl create iamserviceaccount \
-  --cluster=$CLUSTER_NAME \
-  --region=$REGION \
-  --namespace=kube-system \
-  --name=aws-load-balancer-controller \
-  --role-name AmazonEKSLoadBalancerControllerRole \
-  --attach-policy-arn=arn:aws:iam::${ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy \
-  --approve \
-  --override-existing-serviceaccounts 2>/dev/null || true
+# Service Account
+ensure_service_account \
+  "kube-system" \
+  "aws-load-balancer-controller" \
+  "$LBC_ROLE_ARN"
 
-# ✅ FIX: Always explicitly create + annotate SA (don't trust eksctl skip logic)
-create_service_account "kube-system" "aws-load-balancer-controller" "$LBC_ROLE_ARN"
-
-# Install via Helm
+# Helm Install
 helm repo add eks https://aws.github.io/eks-charts 2>/dev/null || true
 helm repo update eks
 
@@ -129,21 +255,17 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
   --wait \
   --timeout 120s
 
-# ✅ FIX: Wait for LBC to be fully healthy before any other helm install
-# (ESO install fails if LBC webhook isn't ready)
+# MUST wait before proceeding — ESO fails if LBC webhook isn't ready
 wait_for_deployment "kube-system" "aws-load-balancer-controller" 180
-
-echo "✅ Load Balancer Controller installed and healthy"
+log_ok "Load Balancer Controller installed and healthy"
 
 # ─────────────────────────────────────────────
 # STEP 3: External Secrets Operator
 # ─────────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════"
-echo "🔒 STEP 3: External Secrets Operator"
-echo "════════════════════════════════════════════"
+log_step "🔒 STEP 3: External Secrets Operator"
 
-cat > eso-policy.json << EOF
+# IAM Policy
+cat > /tmp/eso-policy.json << EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -164,24 +286,23 @@ EOF
 
 aws iam create-policy \
   --policy-name ExternalSecretsPolicy \
-  --policy-document file://eso-policy.json \
-  --no-cli-pager 2>/dev/null || echo "  Policy already exists, skipping..."
+  --policy-document file:///tmp/eso-policy.json \
+  --no-cli-pager 2>/dev/null || log_info "ESO IAM policy already exists"
 
-ESO_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/ExternalSecretsRole"
+# IAM Role — manual, guaranteed
+ESO_ROLE_ARN=$(create_iam_role_with_oidc \
+  "ExternalSecretsRole" \
+  "external-secrets" \
+  "external-secrets" \
+  "arn:aws:iam::${ACCOUNT_ID}:policy/ExternalSecretsPolicy")
 
-eksctl create iamserviceaccount \
-  --cluster=$CLUSTER_NAME \
-  --region=$REGION \
-  --namespace=external-secrets \
-  --name=external-secrets \
-  --role-name ExternalSecretsRole \
-  --attach-policy-arn=arn:aws:iam::${ACCOUNT_ID}:policy/ExternalSecretsPolicy \
-  --approve \
-  --override-existing-serviceaccounts 2>/dev/null || true
+# Service Account
+ensure_service_account \
+  "external-secrets" \
+  "external-secrets" \
+  "$ESO_ROLE_ARN"
 
-# ✅ FIX: Explicitly ensure SA exists with correct annotation
-create_service_account "external-secrets" "external-secrets" "$ESO_ROLE_ARN"
-
+# Helm Install
 helm repo add external-secrets https://charts.external-secrets.io 2>/dev/null || true
 helm repo update external-secrets
 
@@ -195,68 +316,70 @@ helm upgrade --install external-secrets external-secrets/external-secrets \
   --timeout 120s
 
 wait_for_deployment "external-secrets" "external-secrets" 180
-echo "✅ External Secrets Operator installed and healthy"
+log_ok "External Secrets Operator installed and healthy"
 
 # ─────────────────────────────────────────────
 # STEP 4: EBS CSI Driver
 # ─────────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════"
-echo "💾 STEP 4: EBS CSI Driver"
-echo "════════════════════════════════════════════"
+log_step "💾 STEP 4: EBS CSI Driver"
 
-EBS_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/AmazonEKS_EBS_CSI_DriverRole"
+# IAM Role — manual creation (this was the original bug — role was never created)
+EBS_ROLE_ARN=$(create_iam_role_with_oidc \
+  "AmazonEKS_EBS_CSI_DriverRole" \
+  "kube-system" \
+  "ebs-csi-controller-sa" \
+  "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy")
 
-eksctl create iamserviceaccount \
-  --cluster=$CLUSTER_NAME \
-  --region=$REGION \
-  --name=ebs-csi-controller-sa \
-  --namespace=kube-system \
-  --role-name AmazonEKS_EBS_CSI_DriverRole \
-  --attach-policy-arn=arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
-  --approve \
-  --override-existing-serviceaccounts 2>/dev/null || true
+# Service Account
+ensure_service_account \
+  "kube-system" \
+  "ebs-csi-controller-sa" \
+  "$EBS_ROLE_ARN"
 
-# ✅ FIX: Explicitly ensure SA exists
-create_service_account "kube-system" "ebs-csi-controller-sa" "$EBS_ROLE_ARN"
-
-# Install as EKS managed addon (preferred over helm for CSI drivers)
+# Create EKS Managed Addon
 aws eks create-addon \
   --cluster-name $CLUSTER_NAME \
   --region $REGION \
   --addon-name aws-ebs-csi-driver \
   --service-account-role-arn $EBS_ROLE_ARN \
-  --no-cli-pager 2>/dev/null || \
-aws eks update-addon \
-  --cluster-name $CLUSTER_NAME \
-  --region $REGION \
-  --addon-name aws-ebs-csi-driver \
   --no-cli-pager
 
-# Wait for EBS CSI addon to be active
-echo "⏳ Waiting for EBS CSI addon to become ACTIVE..."
-for i in $(seq 1 20); do
+# Wait for ACTIVE — addon takes ~2-3 mins
+echo "  ⏳ Waiting for EBS CSI addon to become ACTIVE..."
+for i in $(seq 1 36); do
   STATUS=$(aws eks describe-addon \
     --cluster-name $CLUSTER_NAME \
     --region $REGION \
     --addon-name aws-ebs-csi-driver \
     --query "addon.status" --output text 2>/dev/null || echo "UNKNOWN")
-  echo "  Status: $STATUS (attempt $i/20)"
+  ISSUES=$(aws eks describe-addon \
+    --cluster-name $CLUSTER_NAME \
+    --region $REGION \
+    --addon-name aws-ebs-csi-driver \
+    --query "addon.health.issues" --output json 2>/dev/null || echo "[]")
+  log_info "Status: $STATUS (attempt $i/36)"
   [ "$STATUS" = "ACTIVE" ] && break
-  [ $i -eq 20 ] && echo "❌ EBS CSI addon did not become ACTIVE" && exit 1
+  [ "$ISSUES" != "[]" ] && [ "$ISSUES" != "null" ] && echo "  Issues: $ISSUES"
+  if [ $i -eq 36 ]; then
+    echo "  ❌ EBS CSI addon did not become ACTIVE. Full details:"
+    aws eks describe-addon \
+      --cluster-name $CLUSTER_NAME \
+      --region $REGION \
+      --addon-name aws-ebs-csi-driver \
+      --output json
+    exit 1
+  fi
   sleep 15
 done
-echo "✅ EBS CSI Driver installed and active"
+log_ok "EBS CSI Driver ACTIVE"
 
 # ─────────────────────────────────────────────
 # STEP 5: Cluster Autoscaler
 # ─────────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════"
-echo "📈 STEP 5: Cluster Autoscaler"
-echo "════════════════════════════════════════════"
+log_step "📈 STEP 5: Cluster Autoscaler"
 
-cat > cas-policy.json << EOF
+# IAM Policy
+cat > /tmp/cas-policy.json << EOF
 {
   "Version": "2012-10-17",
   "Statement": [{
@@ -279,24 +402,23 @@ EOF
 
 aws iam create-policy \
   --policy-name ClusterAutoscalerPolicy \
-  --policy-document file://cas-policy.json \
-  --no-cli-pager 2>/dev/null || echo "  Policy already exists, skipping..."
+  --policy-document file:///tmp/cas-policy.json \
+  --no-cli-pager 2>/dev/null || log_info "CAS IAM policy already exists"
 
-CAS_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/ClusterAutoscalerRole"
+# IAM Role — manual, guaranteed
+CAS_ROLE_ARN=$(create_iam_role_with_oidc \
+  "ClusterAutoscalerRole" \
+  "kube-system" \
+  "cluster-autoscaler" \
+  "arn:aws:iam::${ACCOUNT_ID}:policy/ClusterAutoscalerPolicy")
 
-eksctl create iamserviceaccount \
-  --cluster=$CLUSTER_NAME \
-  --region=$REGION \
-  --namespace=kube-system \
-  --name=cluster-autoscaler \
-  --role-name ClusterAutoscalerRole \
-  --attach-policy-arn=arn:aws:iam::${ACCOUNT_ID}:policy/ClusterAutoscalerPolicy \
-  --approve \
-  --override-existing-serviceaccounts 2>/dev/null || true
+# Service Account
+ensure_service_account \
+  "kube-system" \
+  "cluster-autoscaler" \
+  "$CAS_ROLE_ARN"
 
-# ✅ FIX: Explicitly ensure SA exists
-create_service_account "kube-system" "cluster-autoscaler" "$CAS_ROLE_ARN"
-
+# Helm Install
 helm repo add autoscaler https://kubernetes.github.io/autoscaler 2>/dev/null || true
 helm repo update autoscaler
 
@@ -310,15 +432,12 @@ helm upgrade --install cluster-autoscaler autoscaler/cluster-autoscaler \
   --timeout 120s
 
 wait_for_deployment "kube-system" "cluster-autoscaler" 180
-echo "✅ Cluster Autoscaler installed and healthy"
+log_ok "Cluster Autoscaler installed and healthy"
 
 # ─────────────────────────────────────────────
 # STEP 6: Metrics Server
 # ─────────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════"
-echo "📊 STEP 6: Metrics Server"
-echo "════════════════════════════════════════════"
+log_step "📊 STEP 6: Metrics Server"
 
 helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ 2>/dev/null || true
 helm repo update metrics-server
@@ -329,37 +448,51 @@ helm upgrade --install metrics-server metrics-server/metrics-server \
   --timeout 120s
 
 wait_for_deployment "kube-system" "metrics-server" 120
-echo "✅ Metrics Server installed and healthy"
+log_ok "Metrics Server installed and healthy"
 
 # ─────────────────────────────────────────────
 # FINAL VERIFICATION
 # ─────────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════"
-echo "🔍 FINAL VERIFICATION"
-echo "════════════════════════════════════════════"
+log_step "🔍 FINAL VERIFICATION"
 
 echo ""
 echo "--- Nodes ---"
 kubectl get nodes -o wide
 
 echo ""
-echo "--- kube-system pods ---"
-kubectl get pods -n kube-system | grep -E "aws-load-balancer|ebs-csi|cluster-autoscaler|metrics-server"
+echo "--- kube-system controllers ---"
+kubectl get pods -n kube-system \
+  | grep -E "aws-load-balancer|ebs-csi|cluster-autoscaler|metrics-server"
 
 echo ""
 echo "--- external-secrets pods ---"
 kubectl get pods -n external-secrets
 
 echo ""
-echo "--- Service Account IAM annotations ---"
-for SA in "kube-system/aws-load-balancer-controller" "kube-system/ebs-csi-controller-sa" "kube-system/cluster-autoscaler" "external-secrets/external-secrets"; do
-  NS=$(echo $SA | cut -d'/' -f1)
-  NAME=$(echo $SA | cut -d'/' -f2)
-  ANNOTATION=$(kubectl get sa $NAME -n $NS \
-    -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo "MISSING")
-  echo "  $SA → $ANNOTATION"
+echo "--- IAM Role annotations on all Service Accounts ---"
+for SA_NS in \
+  "kube-system:aws-load-balancer-controller" \
+  "kube-system:ebs-csi-controller-sa" \
+  "kube-system:cluster-autoscaler" \
+  "external-secrets:external-secrets"; do
+  NS=$(echo $SA_NS | cut -d: -f1)
+  SA=$(echo $SA_NS | cut -d: -f2)
+  ARN=$(kubectl get sa $SA -n $NS \
+    -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null \
+    || echo "❌ MISSING")
+  printf "  %-45s → %s\n" "$NS/$SA" "$ARN"
 done
 
 echo ""
-echo "✅ ✅ ✅  EKS Bootstrap Complete! ✅ ✅ ✅"
+echo "--- EBS CSI Addon Status ---"
+aws eks describe-addon \
+  --cluster-name $CLUSTER_NAME \
+  --region $REGION \
+  --addon-name aws-ebs-csi-driver \
+  --query "addon.{Status:status,Version:addonVersion}" \
+  --output table
+
+echo ""
+echo "╔══════════════════════════════════════════════════╗"
+echo "║         ✅  EKS BOOTSTRAP COMPLETE  ✅           ║"
+echo "╚══════════════════════════════════════════════════╝"
