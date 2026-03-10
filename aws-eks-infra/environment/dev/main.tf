@@ -52,6 +52,7 @@ module "eks" {
     subnet_ids = module.vpc.emart_private_subnet_id
     node_groups_size = var.node_groups_size
     user_principal_arn = "arn:aws:iam::729127835402:role/access-admin-eks"
+    eks_node_security_group_id = module.security_groups.eks_node_sg
 }
 
 module "rds" {
@@ -102,6 +103,17 @@ module "secrets" {
     db_password = random_password.db_password.result
     db_name = var.db_name
     db_endpoint = module.rds.rds_endpoint
+}
+
+module "iam" {
+    source = "../../modules/iam"
+
+    cluster_name = var.cluster_name
+    environment = var.environment
+    project = var.project
+    oidc_provider_arn = module.eks.oidc_provider_arn
+    oidc_provider = module.eks.oidc_provider_url
+    secrets_arn = module.secrets.secret_arn
 }
 
 # module "iam" {

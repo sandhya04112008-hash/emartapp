@@ -39,3 +39,15 @@ variable "user_principal_arn" {
   description = "ARN of the IAM user to grant EKS cluster access"
   type        = string
 }
+
+variable "additional_security_group_ids" {
+  description = "Additional security group IDs to attach to EKS nodes"
+  type        = list(string)
+  default     = []
+}
+
+variable "eks_node_security_group_id" {
+  description = "Security group ID for EKS nodes"
+  type        = string
+  default     = ""
+}

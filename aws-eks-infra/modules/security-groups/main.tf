@@ -79,7 +79,7 @@ resource "aws_security_group" "monogodb-sg-ng" {
         from_port = 27017
         to_port = 27017
         protocol = "tcp"
-        security_groups = [aws_security_group.db-sg-ng.id]
+        security_groups = [aws_security_group.eks_node_sg.id]
     }
     egress {
         from_port = 0

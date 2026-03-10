@@ -151,6 +151,13 @@ resource "aws_route_table" "db_private_rt" {
 
 }
 
+resource "aws_route" "db_private_route" {
+  count                  = length(var.availability_zones)
+  route_table_id         = aws_route_table.db_private_rt[count.index].id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.emart_nat_gw[count.index].id
+}
+
 resource "aws_route_table_association" "db_private_rt_assoc" {
   count = length(var.availability_zones)
   route_table_id = aws_route_table.db_private_rt[count.index].id

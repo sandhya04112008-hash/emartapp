@@ -71,6 +71,51 @@ resource "aws_iam_role_policy_attachment" "node_group_WorkerNodePolicy" {
     role = aws_iam_role.node_group_role.name
 }
 
+# Comment out launch template temporarily
+# resource "aws_launch_template" "node_group_lt" {
+#   for_each = var.node_groups_size
+#   
+#   name_prefix   = "${var.cluster_name}-${each.key}-"
+#   image_id      = data.aws_ssm_parameter.eks_ami_release_version.value
+#   instance_type = each.value.instance_type[0]
+#   
+#   vpc_security_group_ids = var.eks_node_security_group_id != "" ? [
+#     aws_eks_cluster.eks_cluster_emart.vpc_config[0].cluster_security_group_id,
+#     var.eks_node_security_group_id
+#   ] : [aws_eks_cluster.eks_cluster_emart.vpc_config[0].cluster_security_group_id]
+#   
+#   tag_specifications {
+#     resource_type = "instance"
+#     tags = {
+#       Name = "${var.cluster_name}-${each.key}-node"
+#       Environment = var.environment
+#       Project = var.project
+#       NodeGroup = each.key
+#       "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+#     }
+#   }
+#   
+#   tag_specifications {
+#     resource_type = "volume"
+#     tags = {
+#       Name = "${var.cluster_name}-${each.key}-node-volume"
+#       Environment = var.environment
+#       Project = var.project
+#     }
+#   }
+#   
+#   tags = {
+#     Name = "${var.cluster_name}-${each.key}-launch-template"
+#     Environment = var.environment
+#     Project = var.project
+#   }
+# }
+
+# Comment out SSM parameter lookup
+# data "aws_ssm_parameter" "eks_ami_release_version" {
+#   name = "/aws/service/eks/optimized-ami/1.31/amazon-linux-2/recommended/image_id"
+# }
+
 resource "aws_eks_node_group" "emart_node_group" {
     for_each = var.node_groups_size
     cluster_name = var.cluster_name
@@ -85,7 +130,13 @@ resource "aws_eks_node_group" "emart_node_group" {
       desired_size = each.value.scaling_config.desired_size
       max_size = each.value.scaling_config.max_size
       min_size = each.value.scaling_config.min_size
-    } 
+    }
+
+    tags = {
+      Name = "${var.cluster_name}-${each.key}-node-group"
+      Environment = var.environment
+      Project = var.project
+    }
 
     depends_on = [ aws_iam_role_policy_attachment.node_group_WorkerNodePolicy ]
 }
@@ -105,4 +156,21 @@ resource "aws_eks_access_policy_association" "user_policy" {
   }
 
   depends_on = [aws_eks_access_entry.user_access]
+}
+
+# OIDC Provider for IRSA
+data "tls_certificate" "eks_oidc" {
+  url = aws_eks_cluster.eks_cluster_emart.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "eks_oidc" {
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.eks_oidc.certificates[0].sha1_fingerprint]
+  url             = aws_eks_cluster.eks_cluster_emart.identity[0].oidc[0].issuer
+
+  tags = {
+    Name = "${var.cluster_name}-oidc-provider"
+    Environment = var.environment
+    Project = var.project
+  }
 }

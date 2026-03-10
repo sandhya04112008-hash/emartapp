@@ -15,5 +15,15 @@ output "node_group_id" {
 
 output "master_oidc_connect" {
   value = aws_eks_cluster.eks_cluster_emart.identity[0].oidc[0].issuer
-  }
+}
+
+output "oidc_provider_arn" {
+  description = "ARN of the OIDC provider for the EKS cluster"
+  value       = aws_iam_openid_connect_provider.eks_oidc.arn
+}
+
+output "oidc_provider_url" {
+  description = "URL of the OIDC provider for the EKS cluster"
+  value       = replace(aws_eks_cluster.eks_cluster_emart.identity[0].oidc[0].issuer, "https://", "")
+}
 
