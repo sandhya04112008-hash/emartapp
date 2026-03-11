@@ -116,6 +116,17 @@ module "iam" {
     secrets_arn = module.secrets.secret_arn
 }
 
+# Add security group rule to allow EKS cluster security group to access RDS
+resource "aws_security_group_rule" "rds_from_eks_cluster" {
+  type                     = "ingress"
+  from_port                = 3306
+  to_port                  = 3306
+  protocol                 = "tcp"
+  source_security_group_id = module.eks.cluster_security_group_id
+  security_group_id        = module.security_groups.db_ng_sg
+  description              = "Allow MySQL access from EKS cluster security group"
+}
+
 # module "iam" {
 #     source = "../../modules/iam"
 

@@ -59,6 +59,14 @@ resource "aws_security_group" "db-sg-ng" {
         protocol = "tcp"
         security_groups = [aws_security_group.eks_node_sg.id]
     }
+    # Allow traffic from private subnets where EKS nodes are located
+    ingress {
+        from_port = 3306
+        to_port = 3306
+        protocol = "tcp"
+        cidr_blocks = ["10.0.16.0/20", "10.0.32.0/20"]
+        description = "Allow MySQL access from EKS private subnets"
+    }
     egress {
         from_port = 0
         to_port = 0
