@@ -1,5 +1,5 @@
 resource  "aws_secretsmanager_secret" "db_credentials" {
-    name = "${var.name}-db-credentials-dev-app"
+    name = "${var.name}-db-credentials-dev-app-1"
      recovery_window_in_days = 7   
 
      lifecycle {
