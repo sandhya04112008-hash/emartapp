@@ -27,12 +27,20 @@ app.get('/', (req,res) => {
   res.sendFile(process.cwd()+"/client/dist/client/index.html")
 })
 
+// Health check endpoint for Kubernetes probes
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK', message: 'Server is healthy' });
+});
+
 app.use("/api/user", userRoutes);
 app.use("/api/shop", shopRoutes);
 
 
 mongoose
-  .connect(mongooseURI)
+  .connect(mongooseURI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+  })
   .then(() => {
     const port = process.env.PORT || 5000;
     const server = app.listen(port, () => {

@@ -56,8 +56,8 @@ function verifyToken(req, res, next) {
 // @access  Public
 router.get("/info", async (req, res) => {
   try {
-    let productsTotal = await Product.find().count();
-    let ordersTotal = await Order.find().count();
+    let productsTotal = await Product.countDocuments();
+    let ordersTotal = await Order.countDocuments();
     res.json({ success: true, productsTotal, ordersTotal });
   } catch {
     res.status(404).json({ success: false, message: "Failed to retrive information" });
