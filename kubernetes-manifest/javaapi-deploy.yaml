@@ -30,7 +30,7 @@ spec:
           value: ap-south-1
         envFrom:
         - secretRef:
-            name: emart-db-credentials-devsecret-stging
+            name: emart-db-credentials-dev-app-1
         resources:
             requests:
               memory: "512Mi"
